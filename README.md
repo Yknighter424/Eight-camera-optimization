@@ -176,7 +176,8 @@ camera_8visibility/
 ## 作者
 
 - Zhang-wen feng
--  游承皓
+- 游承皓
+- 林采伶
 
 ## 更新日誌
 
@@ -199,8 +200,8 @@ camera_8visibility/
 ```bibtex
 @software{eight_camera_motion_capture,
   title={Eight-Camera 3D Human Pose Estimation and Motion Capture System},
-  author={Zhang-wen feng and Yao-Chung Chang},
+  author={Zhang-wen feng and 游承皓 and 林采伶},
   year={2024},
-  url={https://github.com/Yknighter424/eight-camera-motion-capture}
+  url={https://github.com/Yknighter424/Eight-camera-optimization}
 }
 ``` 
