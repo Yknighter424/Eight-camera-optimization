@@ -1122,8 +1122,15 @@ def process_videos(video_paths, start_frame=0):
         images = {cam_id: frame.copy() for cam_id, frame in frames.items()}
         
         print(f"處理第 {frame_count + 1} 幀")
-        if frame_count == 912:
+        # 仅处理300帧以加快处理速度
+        if frame_count == 300:
+            print("达到设定的300帧限制，停止处理")
             break
+            
+        # 实施跳帧处理 - 每3帧处理1帧
+        if frame_count % 3 != 0:
+            frame_count += 1
+            continue
             
         # 處理姿態估計
         points_3d, updated_images = process_frame(detector, frames, images, cams_params, cam_P)
@@ -2374,8 +2381,8 @@ def optimize_points_gom_global(points_sequence, reference_lengths, poses_sequenc
         (11, 13), (13, 15),  # 左手臂
         (12, 14), (14, 16),  # 右手臂
         (11, 23), (12, 24),  # 軀幹
-        (23, 25), (25, 27), (27, 29), (29, 31),  # 左腿
-        (24, 26), (26, 28), (28, 30), (30, 32)   # 右腿
+        (23, 25), (25, 27), (27, 29), (29, 31), (27, 31),  # 左腿
+        (24, 26), (26, 28), (28, 30), (30, 32), (28, 32)   # 右腿
     ]
     def objective_function(points):
         points_3d = points.reshape(-1, 33, 3)
@@ -2542,6 +2549,325 @@ def optimize_points_gom_deprecated(points_sequence, reference_lengths):
             print(f"已處理: {i}/{len(points_sequence)} 幀")
     
     return optimized_sequence
+
+def optimize_points_gom_gpu(points_sequence, reference_lengths, poses_sequence, camera_params_sequence, projection_matrices_sequence, lambda_smooth=0.1, lambda_reproj=1.0):
+    """
+    使用GPU加速的GOM优化 - 同时考虑重投影精度、时间平滑性和骨架长度约束
+    Args:
+        points_sequence: 原始3D点序列 [frames, 33, 3]
+        reference_lengths: 参考肢段长度
+        poses_sequence: list，每一帧的poses字典
+        camera_params_sequence: list，每一帧的相机参数字典
+        projection_matrices_sequence: list，每一帧的投影矩阵字典
+        lambda_smooth: 时间平滑项权重
+        lambda_reproj: 重投影误差权重
+    Returns:
+        optimized_sequence: 优化后的3D点序列
+    """
+    try:
+        import tensorflow as tf
+        print("使用TensorFlow GPU加速GOM优化...")
+        
+        # 检查是否有可用的GPU
+        gpus = tf.config.list_physical_devices('GPU')
+        if gpus:
+            for gpu in gpus:
+                print(f"找到GPU: {gpu}")
+            # 启用内存增长，防止分配全部GPU内存
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+            print("GPU内存设置已优化")
+        else:
+            print("未检测到GPU，将使用CPU运行")
+
+        # 定义骨骼连接关系
+        limb_connections = [
+            (11, 12),  # 肩膀
+            (11, 13), (13, 15),  # 左手臂
+            (12, 14), (14, 16),  # 右手臂
+            (11, 23), (12, 24),  # 躯干
+            (23, 25), (25, 27), (27, 29), (29, 31),  # 左腿
+            (24, 26), (26, 28), (28, 30), (30, 32)   # 右腿
+        ]
+
+        # 将数据转换为TensorFlow张量
+        points_sequence_tf = tf.convert_to_tensor(points_sequence, dtype=tf.float32)
+        reference_lengths_tf = tf.convert_to_tensor(reference_lengths, dtype=tf.float32)
+        
+        # 获取形状信息
+        num_frames = points_sequence.shape[0]
+        
+        # 创建优化变量 - 使用原始点作为初始值
+        points_var = tf.Variable(points_sequence_tf)
+        
+        # 设置优化器
+        optimizer = tf.optimizers.Adam(learning_rate=0.01)
+        
+        # 进度跟踪
+        num_iterations = 300  # 优化迭代次数
+        print(f"开始GPU优化，将进行{num_iterations}次迭代...")
+        
+        # 保存历史损失
+        loss_history = []
+        
+        # 定义单次优化步骤
+        @tf.function
+        def optimization_step():
+            with tf.GradientTape() as tape:
+                # 计算时序平滑损失
+                if num_frames > 1:
+                    smoothness_loss = tf.reduce_sum(tf.square(points_var[1:] - points_var[:-1]))
+                    smoothness_loss = lambda_smooth * smoothness_loss
+                else:
+                    smoothness_loss = tf.constant(0.0, dtype=tf.float32)
+                
+                # 计算骨架长度损失 (软约束版本)
+                length_loss = tf.constant(0.0, dtype=tf.float32)
+                
+                for (start, end), ref_length in zip(limb_connections, reference_lengths):
+                    # 计算所有帧的骨骼向量
+                    bone_vectors = points_var[:, end] - points_var[:, start]
+                    # 计算当前长度
+                    current_lengths = tf.norm(bone_vectors, axis=1)
+                    # 与参考长度比较
+                    length_diff = current_lengths - ref_length
+                    # 使用均方误差作为损失
+                    length_loss += 100.0 * tf.reduce_mean(tf.square(length_diff))  # 权重设为100使其优先级高
+                
+                # 添加重投影误差损失
+                reproj_loss = tf.constant(0.0, dtype=tf.float32)
+                
+                # 为每一帧计算重投影误差
+                for i in range(num_frames):
+                    frame_points = points_var[i]
+                    
+                    # 跳过没有足够检测数据的帧
+                    if i >= len(poses_sequence) or len(poses_sequence[i]) < 3:
+                        continue
+                    
+                    poses = poses_sequence[i]
+                    camera_params = camera_params_sequence[i]
+                    projection_matrices = projection_matrices_sequence[i]
+                    
+                    frame_reproj_error = tf.constant(0.0, dtype=tf.float32)
+                    num_valid_cameras = 0
+                    
+                    # 计算每个相机的重投影误差
+                    for cam_id, pose_2d in poses.items():
+                        if cam_id not in camera_params or cam_id not in projection_matrices:
+                            continue
+                            
+                        mtx, dist = camera_params[cam_id]
+                        P = projection_matrices[cam_id]
+                        
+                        # 将内参和畸变系数转换为张量
+                        mtx_tensor = tf.constant(mtx, dtype=tf.float32)
+                        
+                        # 获取旋转矩阵和平移向量
+                        R = P[:, :3]
+                        t = P[:, 3:]
+                        
+                        # 将3D点投影到2D
+                        # 简化的投影：projected_2d = R * point_3d + t
+                        points_3d_homogeneous = tf.concat([frame_points, tf.ones([33, 1], dtype=tf.float32)], axis=1)
+                        projected_2d_homogeneous = tf.matmul(points_3d_homogeneous, tf.transpose(P))
+                        
+                        # 归一化齐次坐标
+                        projected_2d = projected_2d_homogeneous[:, :2] / projected_2d_homogeneous[:, 2:3]
+                        
+                        # 计算与2D检测的均方误差
+                        pose_2d_tensor = tf.constant(pose_2d, dtype=tf.float32)
+                        camera_error = tf.reduce_mean(tf.square(projected_2d - pose_2d_tensor))
+                        
+                        frame_reproj_error += camera_error
+                        num_valid_cameras += 1
+                    
+                    # 计算平均重投影误差
+                    if num_valid_cameras > 0:
+                        frame_reproj_error = frame_reproj_error / tf.cast(num_valid_cameras, tf.float32)
+                        reproj_loss += frame_reproj_error
+                
+                # 应用重投影误差权重
+                reproj_loss = lambda_reproj * reproj_loss
+                
+                # 总损失：时间平滑 + 骨架长度 + 重投影误差
+                total_loss = smoothness_loss + length_loss + reproj_loss
+                
+                return total_loss, smoothness_loss, length_loss, reproj_loss
+            
+        # 主优化循环
+        print("GPU优化进度: [", end="")
+        progress_step = num_iterations // 20  # 20个进度点
+        for i in range(num_iterations):
+            # 执行优化步骤
+            total_loss, smoothness_loss, length_loss, reproj_loss = optimization_step()
+            
+            # 计算梯度并应用
+            with tf.GradientTape() as tape:
+                total_loss, _, _, _ = optimization_step()
+            
+            gradients = tape.gradient(total_loss, [points_var])
+            optimizer.apply_gradients(zip(gradients, [points_var]))
+            
+            # 存储历史损失
+            loss_history.append(total_loss.numpy())
+            
+            # 显示进度条
+            if i % progress_step == 0:
+                print("=", end="", flush=True)
+                
+            # 每10次迭代打印一次进度
+            if i % 10 == 0 or i == num_iterations - 1:
+                if i % 50 == 0:  # 减少打印频率，避免输出过多
+                    print(f"\n迭代 {i}/{num_iterations}: 总损失={total_loss.numpy():.4f}, "
+                          f"平滑损失={smoothness_loss.numpy():.4f}, 长度损失={length_loss.numpy():.4f}, "
+                          f"重投影损失={reproj_loss.numpy():.4f}", end="")
+        
+        print("] 完成！")
+        
+        # 优化后，应用硬约束以确保骨架长度精确
+        optimized_points = points_var.numpy()
+        
+        # 对优化结果应用硬约束
+        for frame_idx in range(len(optimized_points)):
+            frame_points = optimized_points[frame_idx]
+            # 迭代多次以确保满足约束
+            for _ in range(3):
+                for (start, end), ref_length in zip(limb_connections, reference_lengths):
+                    # 计算当前骨骼向量
+                    current_vector = frame_points[end] - frame_points[start]
+                    current_length = np.linalg.norm(current_vector)
+                    
+                    if current_length == 0:
+                        continue
+                    
+                    # 计算调整因子
+                    scale_factor = ref_length / current_length
+                    
+                    # 计算中点（固定点）
+                    mid_point = (frame_points[start] + frame_points[end]) / 2
+                    
+                    # 计算单位方向向量
+                    direction = current_vector / current_length
+                    
+                    # 强制执行长度约束
+                    frame_points[start] = mid_point - direction * ref_length / 2
+                    frame_points[end] = mid_point + direction * ref_length / 2
+            
+            optimized_points[frame_idx] = frame_points
+        
+        # 评估优化结果
+        print("GPU优化完成!")
+        print(f"初始损失: {loss_history[0]:.4f}")
+        print(f"最终损失: {loss_history[-1]:.4f}")
+        print(f"损失改善: {(loss_history[0] - loss_history[-1])/loss_history[0]*100:.2f}%")
+        
+        return optimized_points
+        
+    except ImportError as e:
+        print(f"TensorFlow导入失败，无法使用GPU优化: {e}")
+        print("回退到CPU版本的GOM优化...")
+        return optimize_points_gom(points_sequence, reference_lengths, poses_sequence, 
+                                  camera_params_sequence, projection_matrices_sequence, 
+                                  lambda_smooth, lambda_reproj)
+    except Exception as e:
+        print(f"GPU优化过程中出错: {e}")
+        import traceback
+        traceback.print_exc()
+        print("回退到CPU版本的GOM优化...")
+        return optimize_points_gom(points_sequence, reference_lengths, poses_sequence, 
+                                  camera_params_sequence, projection_matrices_sequence, 
+                                  lambda_smooth, lambda_reproj)
+
+# 在原有的main函数中修改GOM优化部分调用
+def main():
+    """
+    主程序
+    """
+    # 確保LSTM保持關閉
+    LSTM_CONFIG['enabled'] = False  # 在主程序中再次確認LSTM為關閉狀態
+    
+    # 視頻路徑設置
+    video_paths = {
+        'l1': r"C:\Users\godli\Dropbox\Camera_passion changes lives\8camera_0228\685\685-02282025150351-0000.avi",#C:\Users\godli\Dropbox\Camera_passion changes lives\8camera_0228
+        'l2': r"C:\Users\godli\Dropbox\Camera_passion changes lives\8camera_0228\684\684-02282025150353-0000.avi",
+        'l3': r"C:\Users\godli\Dropbox\Camera_passion changes lives\8camera_0228\688\688-02282025150359-0000.avi",
+        'c':  r"C:\Users\godli\Dropbox\Camera_passion changes lives\8camera_0228\1034\1034-02282025150358-0000.avi",
+        'r1': r"C:\Users\godli\Dropbox\Camera_passion changes lives\8camera_0228\686\686-02282025150352-0000.avi",
+        'r2': r"C:\Users\godli\Dropbox\Camera_passion changes lives\8camera_0228\725\725-02282025150355-0000.avi",
+        'r3': r"C:\Users\godli\Dropbox\Camera_passion changes lives\8camera_0228\724\724-02282025150356-0000.avi",
+        'r4': r"C:\Users\godli\Dropbox\Camera_passion changes lives\8camera_0228\826\826-02282025150354-0000.avi"
+    }
+    
+    print(f"LSTM優化狀態: {'啟用' if LSTM_CONFIG['enabled'] else '禁用'}")
+    
+    # 處理視頻
+    points_3d, aruco_axis, cam_axes, poses_sequence, camera_params_sequence, projection_matrices_sequence = process_videos(video_paths)
+    
+    if len(points_3d) == 0:
+        print("未能從視頻中提取任何3D關鍵點。")
+        return
+    
+    # 可視化3D點雲
+    print("開始3D可視化...")
+    visualize_3d_animation_eight_cameras(
+        points_3d,
+        aruco_axis,
+        cam_axes,
+        title='Eight Camera Motion Capture'
+    )
+
+    # 計算第一幀的肢段長度
+    reference_lengths = calculate_limb_lengths(points_3d[0])  # 使用第一幀的3D點計算肢段長度
+
+    # 使用GPU加速版本的GOM优化
+    print("開始GPU加速的GOM優化，包含重投影精度、時間平滑性和肢段長度約束...")
+    optimized_points = optimize_points_gom_gpu(
+        points_3d, 
+        reference_lengths,
+        poses_sequence,
+        camera_params_sequence,
+        projection_matrices_sequence,
+        lambda_smooth=GOM_CONFIG['lambda_smooth'],  # 時間平滑性權重
+        lambda_reproj=GOM_CONFIG['lambda_reproj']   # 重投影誤差權重
+    )
+
+    # 計算優化後的肢段長度
+    optimized_reference_lengths = calculate_limb_lengths(optimized_points[0])  # 使用優化後的第一幀
+
+    # 計算變異情況
+    variations_before = calculate_limb_length_variations(points_3d, reference_lengths)
+    variations_after = calculate_limb_length_variations(optimized_points, optimized_reference_lengths)
+
+    # 打印變異情況
+    print("優化前肢段長度變異情況:")
+    for variation in variations_before:
+        print(f"{variation['limb']}: 平均長度 = {variation['mean_length']:.2f}, 標準差 = {variation['std_dev']:.2f}, 變異百分比 = {variation['variation_percentage']:.2f}%")
+
+    print("\n優化後肢段長度變異情況:")
+    for variation in variations_after:
+        print(f"{variation['limb']}: 平均長度 = {variation['mean_length']:.2f}, 標準差 = {variation['std_dev']:.2f}, 變異百分比 = {variation['variation_percentage']:.2f}%")
+
+    # 可視化優化後的3D點雲
+    print("開始可視化優化後的3D點雲...")
+    visualize_3d_animation_eight_cameras(
+        optimized_points,
+        aruco_axis,
+        cam_axes,
+        title='Optimized 3D Points with GPU-GOM'
+    )
+    
+    # 詢問是否要保存影片
+    save_video = input("是否要保存影片? (y/n): ").lower() == 'y'
+    if save_video:
+        print("請在視覺化界面中選擇合適的視角，然後點擊'保存影片'按鈕")
+        visualize_3d_animation_eight_cameras(
+            optimized_points,
+            aruco_axis,
+            cam_axes,
+            title='GPU Optimized 3D Points',
+            save_video=False  # 不自動保存，而是通過按鈕保存
+        )
 
 if __name__ == "__main__":
     main()
