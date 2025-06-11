@@ -174,8 +174,8 @@ camera_8visibility/
 本項目採用BSD-style許可證。
 
 ## 作者
-
-- Zhang-wen feng
+指導教授：呂東武
+- 張文峰
 - 游承皓
 - 林采伶
 
@@ -200,7 +200,8 @@ camera_8visibility/
 ```bibtex
 @software{eight_camera_motion_capture,
   title={Eight-Camera 3D Human Pose Estimation and Motion Capture System},
-  author={Zhang-wen feng and 游承皓 and 林采伶},
+  author={指導教授：呂東武
+  學生：張文峰 and 游承皓 and 林采伶},
   year={2024},
   url={https://github.com/Yknighter424/Eight-camera-optimization}
 }
